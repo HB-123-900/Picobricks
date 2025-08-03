@@ -12,8 +12,11 @@ import time
 from machine import Pin, PWM
 import random
 import json
+import urequests
+from machine import I2C
 from lib.keypad import Keypad
 from lib.mfrc522 import MFRC522
+from lib.ssd1306 import SSD1306_I2C
 
 # --- Hardware Setup ---
 # IMPORTANT: These are the GPIO pin numbers.
@@ -22,6 +25,19 @@ SERVO_PIN = 15          # Pin for the servo motor's data line
 MOTION_PIN = 28         # Pin for the PIR motion sensor's output
 KEYPAD_ROWS = [0, 1, 2, 3] # Pins for the keypad rows
 KEYPAD_COLS = [4, 5, 6]   # Pins for the keypad columns
+
+# LED and Buzzer Pins
+RED_LED_PIN = 13
+GREEN_LED_PIN = 14
+BLUE_LED_PIN = 16
+BUZZER_PIN = 17
+
+# OLED Display (SSD1306)
+# Connect your I2C OLED display to these pins.
+OLED_SDA_PIN = 20
+OLED_SCL_PIN = 21
+OLED_WIDTH = 128
+OLED_HEIGHT = 64
 
 # RFID Module (RC522)
 # Connect your RC522 module to these pins.
@@ -37,6 +53,9 @@ MAX_AUTHORIZED_TAGS = 2
 
 # --- Lock Configuration ---
 MOTION_IGNORE_DELAY_S = 3 # Seconds to ignore motion after unlocking
+REMOTE_UNLOCK_PASSWORD = "YOUR_SECRET_PASSWORD" # Change this!
+DURESS_CODE = "911911" # A 6-digit code that secretly triggers an alert
+IFTTT_WEBHOOK_URL = "YOUR_IFTTT_WEBHOOK_URL_HERE" # e.g., https://maker.ifttt.com/trigger/duress_alert/with/key/YOUR_KEY
 
 # --- WiFi Configuration ---
 # IMPORTANT: Replace these with your WiFi network credentials.
@@ -44,6 +63,18 @@ WIFI_SSID = "YOUR_WIFI_SSID"
 WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"
 
 # --- Functions ---
+def log_event(message):
+    """Adds a timestamped event to the log."""
+    global event_log
+    # In MicroPython, time.time() might not be available or might not be a real-time clock.
+    # Using time.ticks_ms() is a more reliable way to get an uptime-based timestamp.
+    timestamp_ms = time.ticks_ms()
+    log_entry = f"{timestamp_ms // 1000}s: {message}"
+    event_log.insert(0, log_entry) # Add to the top
+    if len(event_log) > MAX_LOG_ENTRIES:
+        event_log.pop()
+    print(f"LOG: {log_entry}") # Also print to console for debugging
+
 def load_authorized_tags():
     """Loads authorized RFID tag UIDs from a file."""
     try:
@@ -57,6 +88,64 @@ def save_authorized_tags(tags):
     """Saves a list of authorized RFID tag UIDs to a file."""
     with open(AUTHORIZED_TAGS_FILE, "w") as f:
         json.dump(tags, f)
+
+def play_tone(buzzer, frequency, duration):
+    """Plays a tone on the buzzer."""
+    buzzer.duty_u16(1000)
+    buzzer.freq(frequency)
+    time.sleep(duration)
+    buzzer.duty_u16(0)
+
+def play_success_tone(buzzer):
+    """Plays a success tone."""
+    play_tone(buzzer, 600, 0.1)
+    time.sleep(0.05)
+    play_tone(buzzer, 800, 0.1)
+    time.sleep(0.05)
+    play_tone(buzzer, 1000, 0.1)
+
+def play_error_tone(buzzer):
+    """Plays an error tone."""
+    play_tone(buzzer, 200, 0.3)
+
+def play_program_tone(buzzer):
+    """Plays a short tone for RFID programming."""
+    play_tone(buzzer, 500, 0.1)
+
+def update_display(oled, status, code=""):
+    """Updates the OLED display with the current status and code."""
+    oled.fill(0)
+    oled.text("Status:", 0, 0)
+    oled.text(status, 0, 10)
+    if code:
+        oled.text("Code:", 0, 30)
+        oled.text(code, 0, 40)
+    oled.show()
+
+def display_message(oled, line1, line2="", duration_s=2):
+    """Displays a temporary message on the OLED."""
+    oled.fill(0)
+    oled.text(line1, 0, 10)
+    if line2:
+        oled.text(line2, 0, 30)
+    oled.show()
+    if duration_s > 0:
+        time.sleep(duration_s)
+
+def trigger_duress_notification():
+    """Sends a web request to IFTTT to trigger a notification."""
+    if not IFTTT_WEBHOOK_URL.startswith("YOUR_IFTTT"):
+        try:
+            print("Sending duress notification...")
+            response = urequests.post(IFTTT_WEBHOOK_URL)
+            response.close()
+            log_event("Duress notification sent")
+        except Exception as e:
+            print(f"Failed to send duress notification: {e}")
+            log_event("Duress notification failed")
+    else:
+        print("IFTTT webhook URL not configured.")
+        log_event("Duress trigger failed: no URL")
 
 def set_servo_angle(servo, angle):
     """Sets the servo to a specific angle."""
@@ -93,7 +182,7 @@ def generate_code():
     """Generates a 6-digit random code."""
     return "".join([str(random.randint(0, 9)) for _ in range(6)])
 
-def get_keypad_or_rfid_input(keypad_instance, rfid_reader_instance, authorized_tags_list):
+def get_keypad_or_rfid_input(keypad_instance, rfid_reader_instance, authorized_tags_list, system_state):
     """
     Waits for keypad input or a valid RFID scan.
     Returns the entered code or a special value for RFID bypass.
@@ -121,12 +210,28 @@ def get_keypad_or_rfid_input(keypad_instance, rfid_reader_instance, authorized_t
             entered_code += key
             print(f"Entered: {entered_code}")
             time.sleep(0.3)
+            # Check for duress code immediately after 6 digits are entered
+            if len(entered_code) == 6 and entered_code == DURESS_CODE:
+                return "DURESS_UNLOCK"
 
         # 3. Handle web requests
         try:
             cl, addr = s.accept()
             print('Client connected from', addr)
-            response = web_page(access_code, ip_address)
+            request = cl.recv(1024)
+            request_str = request.decode('utf-8')
+
+            # Check for POST request for remote unlock
+            if "POST /" in request_str:
+                # Super simple password parsing
+                body_start = request_str.find("password=")
+                if body_start != -1:
+                    password_submitted = request_str[body_start + 9:]
+                    if password_submitted == REMOTE_UNLOCK_PASSWORD:
+                        return "REMOTE_UNLOCK"
+
+            # Otherwise, serve the normal page
+            response = web_page(access_code, ip_address, system_state, event_log)
             cl.send('HTTP/1.0 200 OK\r\nContent-type: text/html\r\n\r\n')
             cl.send(response)
             cl.close()
@@ -135,18 +240,35 @@ def get_keypad_or_rfid_input(keypad_instance, rfid_reader_instance, authorized_t
 
     return entered_code
 
-def web_page(code, ip):
-    """Creates a simple HTML page to display the code."""
+def web_page(code, ip, status, log):
+    """Creates an enhanced HTML page to display status, code, and logs."""
+
+    log_html = "".join([f"<li>{entry}</li>" for entry in log])
+
     html = f"""
     <html>
         <head>
             <title>Pico W Security</title>
-            <meta http-equiv="refresh" content="30">
+            <meta http-equiv="refresh" content="15">
         </head>
         <body>
-            <h1>Random Access Code</h1>
+            <h1>Pico W Security System</h1>
+            <p><strong>Status:</strong> {status}</p>
+            <hr>
+            <h2>Random Access Code</h2>
             <p>Enter this code on the keypad:</p>
-            <h2>{code}</h2>
+            <h2 style="color: blue;">{code}</h2>
+            <hr>
+            <h3>Event Log</h3>
+            <ul>
+                {log_html}
+            </ul>
+            <hr>
+            <h3>Remote Unlock</h3>
+            <form action="/" method="post">
+                Password: <input type="password" name="password">
+                <input type="submit" value="Unlock">
+            </form>
             <p>Connect to your Pico W at: {ip}</p>
         </body>
     </html>
@@ -157,6 +279,8 @@ def web_page(code, ip):
 s = None
 access_code = ""
 ip_address = ""
+event_log = []
+MAX_LOG_ENTRIES = 10
 
 # --- Main Loop ---
 if __name__ == "__main__":
@@ -171,16 +295,30 @@ if __name__ == "__main__":
     spi = SPI(1, baudrate=2500000, polarity=0, phase=0, sck=Pin(RFID_SCK), mosi=Pin(RFID_MOSI), miso=Pin(RFID_MISO))
     rfid_reader = MFRC522(spi=spi, gpioRst=RFID_RST, gpioCs=RFID_SDA)
 
+    # Initialize LEDs and Buzzer
+    red_led = Pin(RED_LED_PIN, Pin.OUT)
+    green_led = Pin(GREEN_LED_PIN, Pin.OUT)
+    blue_led = Pin(BLUE_LED_PIN, Pin.OUT)
+    buzzer = PWM(Pin(BUZZER_PIN))
+
+    # Initialize OLED Display
+    i2c = I2C(0, sda=Pin(OLED_SDA_PIN), scl=Pin(OLED_SCL_PIN), freq=400000)
+    oled = SSD1306_I2C(OLED_WIDTH, OLED_HEIGHT, i2c)
+
     set_servo_angle(servo, 0)
-    print("Servo, motion sensor, keypad, and RFID reader initialized.")
+    print("Servo, motion sensor, keypad, RFID, LEDs, buzzer, and OLED initialized.")
 
     # --- RFID Tag Setup ---
     # Load authorized tags from file, or enter programming mode if none exist.
     authorized_tags = load_authorized_tags()
     if not authorized_tags:
         print("\n--- PROGRAMMING MODE ---")
+        display_message(oled, "PROGRAM MODE", "Scan 2 tags", duration_s=0)
         print(f"No authorized tags found. Please scan {MAX_AUTHORIZED_TAGS} tags to register them.")
+        blue_led.on() # Indicate programming mode
         while len(authorized_tags) < MAX_AUTHORIZED_TAGS:
+            blue_led.toggle() # Blink the blue LED
+            display_message(oled, f"Scan Tag #{len(authorized_tags) + 1}", "", duration_s=0)
             (stat, tag_type) = rfid_reader.request(rfid_reader.REQIDL)
             if stat == rfid_reader.OK:
                 (stat, raw_uid) = rfid_reader.anticoll()
@@ -189,11 +327,15 @@ if __name__ == "__main__":
                     if uid not in authorized_tags:
                         authorized_tags.append(uid)
                         print(f"Tag #{len(authorized_tags)} registered: {uid}")
+                        play_program_tone(buzzer)
                     else:
                         print("Tag already registered. Scan a different tag.")
-                    time.sleep(1) # Wait for tag to be removed
+                        play_error_tone(buzzer)
+                    time.sleep(1)
 
         save_authorized_tags(authorized_tags)
+        blue_led.off()
+        play_success_tone(buzzer)
         print("--- PROGRAMMING MODE COMPLETE ---")
 
     print(f"Authorized tags loaded: {authorized_tags}")
@@ -213,27 +355,52 @@ if __name__ == "__main__":
         while True:
             if system_state == "LOCKED":
                 # System is locked, wait for valid input
+                red_led.on()
+                green_led.off()
                 access_code = generate_code()
+                update_display(oled, "LOCKED", access_code)
                 print("\n----------------------------------")
                 print(f"Generated New Access Code: {access_code}")
                 print(f"View on your phone at http://{ip_address}")
 
-                user_input = get_keypad_or_rfid_input(keypad, rfid_reader, authorized_tags)
+                user_input = get_keypad_or_rfid_input(keypad, rfid_reader, authorized_tags, system_state)
 
-                if user_input == access_code or user_input == "RFID_BYPASS":
-                    if user_input == "RFID_BYPASS":
-                        print("RFID Bypass! Unlocking...")
-                    else:
-                        print("Code Correct! Unlocking...")
+                if user_input == "DURESS_UNLOCK":
+                    log_event("Duress code entered!")
+                    print("Duress code entered. Unlocking normally...")
+                    trigger_duress_notification()
+                    play_success_tone(buzzer) # Appear normal
                     set_servo_angle(servo, 90)
                     system_state = "UNLOCKED"
                     print("System state: UNLOCKED")
+                    display_message(oled, "Access Granted", "UNLOCKED", duration_s=2)
+
+                elif user_input == access_code or user_input == "RFID_BYPASS" or user_input == "REMOTE_UNLOCK":
+                    if user_input == "RFID_BYPASS":
+                        log_event("Unlocked with RFID")
+                        print("RFID Bypass! Unlocking...")
+                    elif user_input == "REMOTE_UNLOCK":
+                        log_event("Unlocked via remote")
+                        print("Remote Unlock! Unlocking...")
+                    else:
+                        log_event("Unlocked with code")
+                        print("Code Correct! Unlocking...")
+                    play_success_tone(buzzer)
+                    set_servo_angle(servo, 90)
+                    system_state = "UNLOCKED"
+                    print("System state: UNLOCKED")
+                    display_message(oled, "Access Granted", "UNLOCKED", duration_s=2)
                 else:
+                    log_event(f"Incorrect code: {user_input}")
                     print("Incorrect code. Please try again.")
-                    time.sleep(1)
+                    play_error_tone(buzzer)
+                    display_message(oled, "Access Denied", "", duration_s=2)
 
             elif system_state == "UNLOCKED":
                 # System is unlocked, wait for door to close
+                red_led.off()
+                green_led.on()
+                update_display(oled, "UNLOCKED")
                 print(f"Door unlocked. Ignoring motion for {MOTION_IGNORE_DELAY_S} seconds...")
                 time.sleep(MOTION_IGNORE_DELAY_S)
 
@@ -242,6 +409,7 @@ if __name__ == "__main__":
                     time.sleep(0.1)
 
                 print("Door closed. Locking now.")
+                log_event("Door closed and locked")
                 set_servo_angle(servo, 0)
                 system_state = "LOCKED"
                 print("System state: LOCKED")
