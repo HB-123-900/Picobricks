@@ -35,6 +35,9 @@ RFID_RST = 9  # RST pin
 AUTHORIZED_TAGS_FILE = "authorized_tags.json"
 MAX_AUTHORIZED_TAGS = 2
 
+# --- Lock Configuration ---
+MOTION_IGNORE_DELAY_S = 3 # Seconds to ignore motion after unlocking
+
 # --- WiFi Configuration ---
 # IMPORTANT: Replace these with your WiFi network credentials.
 WIFI_SSID = "YOUR_WIFI_SSID"
@@ -157,6 +160,7 @@ ip_address = ""
 
 # --- Main Loop ---
 if __name__ == "__main__":
+    system_state = "LOCKED"
     print("Starting security system...")
 
     # --- Initialize Hardware ---
@@ -207,41 +211,41 @@ if __name__ == "__main__":
 
         # --- Main Application Loop ---
         while True:
-            # 1. Generate and display a new code
-            access_code = generate_code()
-            print("\n----------------------------------")
-            print(f"Generated New Access Code: {access_code}")
-            print(f"View on your phone at http://{ip_address}")
+            if system_state == "LOCKED":
+                # System is locked, wait for valid input
+                access_code = generate_code()
+                print("\n----------------------------------")
+                print(f"Generated New Access Code: {access_code}")
+                print(f"View on your phone at http://{ip_address}")
 
-            # 2. Get user input from keypad or RFID
-            user_input = get_keypad_or_rfid_input(keypad, rfid_reader, authorized_tags)
+                user_input = get_keypad_or_rfid_input(keypad, rfid_reader, authorized_tags)
 
-            # 3. Check if the code is correct or RFID was used
-            if user_input == access_code or user_input == "RFID_BYPASS":
-                if user_input == "RFID_BYPASS":
-                    print("RFID Bypass! Activating servo.")
+                if user_input == access_code or user_input == "RFID_BYPASS":
+                    if user_input == "RFID_BYPASS":
+                        print("RFID Bypass! Unlocking...")
+                    else:
+                        print("Code Correct! Unlocking...")
+                    set_servo_angle(servo, 90)
+                    system_state = "UNLOCKED"
+                    print("System state: UNLOCKED")
                 else:
-                    print("Code Correct! Activating servo.")
-                set_servo_angle(servo, 90)
+                    print("Incorrect code. Please try again.")
+                    time.sleep(1)
 
-                # 4. Wait for motion detector
-                print("Waiting for motion...")
+            elif system_state == "UNLOCKED":
+                # System is unlocked, wait for door to close
+                print(f"Door unlocked. Ignoring motion for {MOTION_IGNORE_DELAY_S} seconds...")
+                time.sleep(MOTION_IGNORE_DELAY_S)
+
+                print("Ready to lock. Waiting for door to close (motion trigger)...")
                 while motion_sensor.value() == 0:
                     time.sleep(0.1)
 
-                print("Motion detected!")
-
-                # 5. Wait 10 seconds and reset servo
-                print("Waiting 10 seconds...")
-                time.sleep(10)
-
-                print("Resetting servo.")
+                print("Door closed. Locking now.")
                 set_servo_angle(servo, 0)
-
-            else:
-                print("Incorrect code. Generating a new one.")
-
-            time.sleep(1) # a small delay before new code generation
+                system_state = "LOCKED"
+                print("System state: LOCKED")
+                time.sleep(1) # Debounce/settle time
 
     except Exception as e:
         print(f"A critical error occurred: {e}")
