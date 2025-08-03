@@ -11,7 +11,9 @@ import socket
 import time
 from machine import Pin, PWM
 import random
+import json
 from lib.keypad import Keypad
+from lib.mfrc522 import MFRC522
 
 # --- Hardware Setup ---
 # IMPORTANT: These are the GPIO pin numbers.
@@ -21,12 +23,38 @@ MOTION_PIN = 28         # Pin for the PIR motion sensor's output
 KEYPAD_ROWS = [0, 1, 2, 3] # Pins for the keypad rows
 KEYPAD_COLS = [4, 5, 6]   # Pins for the keypad columns
 
+# RFID Module (RC522)
+# Connect your RC522 module to these pins.
+RFID_SDA = 8  # SDA / CS pin
+RFID_SCK = 10 # SCK pin
+RFID_MOSI = 11 # MOSI pin
+RFID_MISO = 12 # MISO pin
+RFID_RST = 9  # RST pin
+
+# --- RFID Configuration ---
+AUTHORIZED_TAGS_FILE = "authorized_tags.json"
+MAX_AUTHORIZED_TAGS = 2
+
 # --- WiFi Configuration ---
 # IMPORTANT: Replace these with your WiFi network credentials.
 WIFI_SSID = "YOUR_WIFI_SSID"
 WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"
 
 # --- Functions ---
+def load_authorized_tags():
+    """Loads authorized RFID tag UIDs from a file."""
+    try:
+        with open(AUTHORIZED_TAGS_FILE, "r") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        # File doesn't exist or is invalid
+        return []
+
+def save_authorized_tags(tags):
+    """Saves a list of authorized RFID tag UIDs to a file."""
+    with open(AUTHORIZED_TAGS_FILE, "w") as f:
+        json.dump(tags, f)
+
 def set_servo_angle(servo, angle):
     """Sets the servo to a specific angle."""
     # This conversion might need tuning for your specific servo
@@ -62,16 +90,36 @@ def generate_code():
     """Generates a 6-digit random code."""
     return "".join([str(random.randint(0, 9)) for _ in range(6)])
 
-def get_keypad_input(keypad_instance):
+def get_keypad_or_rfid_input(keypad_instance, rfid_reader_instance, authorized_tags_list):
     """
-    Waits for and reads a 6-digit code from the keypad.
-    Also handles web server requests in a non-blocking way.
+    Waits for keypad input or a valid RFID scan.
+    Returns the entered code or a special value for RFID bypass.
     """
     entered_code = ""
-    print("Enter the 6-digit code...")
+    print("Enter the 6-digit code or scan an authorized RFID tag...")
 
     while len(entered_code) < 6:
-        # Handle web requests while waiting for keypad input
+        # 1. Check for RFID tag
+        (stat, tag_type) = rfid_reader_instance.request(rfid_reader_instance.REQIDL)
+        if stat == rfid_reader_instance.OK:
+            (stat, raw_uid) = rfid_reader_instance.anticoll()
+            if stat == rfid_reader_instance.OK:
+                uid = "0x%02x%02x%02x%02x" % (raw_uid[0], raw_uid[1], raw_uid[2], raw_uid[3])
+                if uid in authorized_tags_list:
+                    print(f"Authorized RFID tag scanned: {uid}")
+                    return "RFID_BYPASS"
+                else:
+                    print(f"Unauthorized RFID tag scanned: {uid}")
+                time.sleep(1) # Wait for tag to be removed
+
+        # 2. Check for keypad input
+        key = keypad_instance.scan()
+        if key:
+            entered_code += key
+            print(f"Entered: {entered_code}")
+            time.sleep(0.3)
+
+        # 3. Handle web requests
         try:
             cl, addr = s.accept()
             print('Client connected from', addr)
@@ -80,13 +128,7 @@ def get_keypad_input(keypad_instance):
             cl.send(response)
             cl.close()
         except OSError:
-            pass # No client connected
-
-        key = keypad_instance.scan()
-        if key:
-            entered_code += key
-            print(f"Entered: {entered_code}")
-            time.sleep(0.3) # Small delay to prevent double presses
+            pass
 
     return entered_code
 
@@ -122,9 +164,35 @@ if __name__ == "__main__":
     servo.freq(50)
     motion_sensor = Pin(MOTION_PIN, Pin.IN)
     keypad = Keypad(KEYPAD_ROWS, KEYPAD_COLS)
+    spi = SPI(1, baudrate=2500000, polarity=0, phase=0, sck=Pin(RFID_SCK), mosi=Pin(RFID_MOSI), miso=Pin(RFID_MISO))
+    rfid_reader = MFRC522(spi=spi, gpioRst=RFID_RST, gpioCs=RFID_SDA)
 
     set_servo_angle(servo, 0)
-    print("Servo, motion sensor, and keypad initialized.")
+    print("Servo, motion sensor, keypad, and RFID reader initialized.")
+
+    # --- RFID Tag Setup ---
+    # Load authorized tags from file, or enter programming mode if none exist.
+    authorized_tags = load_authorized_tags()
+    if not authorized_tags:
+        print("\n--- PROGRAMMING MODE ---")
+        print(f"No authorized tags found. Please scan {MAX_AUTHORIZED_TAGS} tags to register them.")
+        while len(authorized_tags) < MAX_AUTHORIZED_TAGS:
+            (stat, tag_type) = rfid_reader.request(rfid_reader.REQIDL)
+            if stat == rfid_reader.OK:
+                (stat, raw_uid) = rfid_reader.anticoll()
+                if stat == rfid_reader.OK:
+                    uid = "0x%02x%02x%02x%02x" % (raw_uid[0], raw_uid[1], raw_uid[2], raw_uid[3])
+                    if uid not in authorized_tags:
+                        authorized_tags.append(uid)
+                        print(f"Tag #{len(authorized_tags)} registered: {uid}")
+                    else:
+                        print("Tag already registered. Scan a different tag.")
+                    time.sleep(1) # Wait for tag to be removed
+
+        save_authorized_tags(authorized_tags)
+        print("--- PROGRAMMING MODE COMPLETE ---")
+
+    print(f"Authorized tags loaded: {authorized_tags}")
 
     try:
         ip_address = connect_wifi(WIFI_SSID, WIFI_PASSWORD)
@@ -137,6 +205,7 @@ if __name__ == "__main__":
         s.listen(5)
         print('Listening on', addr)
 
+        # --- Main Application Loop ---
         while True:
             # 1. Generate and display a new code
             access_code = generate_code()
@@ -144,12 +213,15 @@ if __name__ == "__main__":
             print(f"Generated New Access Code: {access_code}")
             print(f"View on your phone at http://{ip_address}")
 
-            # 2. Get user input from keypad
-            entered_code = get_keypad_input(keypad)
+            # 2. Get user input from keypad or RFID
+            user_input = get_keypad_or_rfid_input(keypad, rfid_reader, authorized_tags)
 
-            # 3. Check if the code is correct
-            if entered_code == access_code:
-                print("Code Correct! Activating servo.")
+            # 3. Check if the code is correct or RFID was used
+            if user_input == access_code or user_input == "RFID_BYPASS":
+                if user_input == "RFID_BYPASS":
+                    print("RFID Bypass! Activating servo.")
+                else:
+                    print("Code Correct! Activating servo.")
                 set_servo_angle(servo, 90)
 
                 # 4. Wait for motion detector
