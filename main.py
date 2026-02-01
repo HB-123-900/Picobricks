@@ -10,7 +10,6 @@ import network
 import socket
 import time
 from machine import Pin, PWM, I2C, SPI
-import random
 import json
 import urequests
 from lib.keypad import Keypad
@@ -178,8 +177,8 @@ def connect_wifi(ssid, password):
     return status[0]
 
 def generate_code():
-    """Generates a 6-digit random code."""
-    return "".join([str(random.randint(0, 9)) for _ in range(6)])
+    """Returns the fixed 6-digit access code."""
+    return "576809"
 
 def get_keypad_or_rfid_input(keypad_instance, rfid_reader_instance, authorized_tags_list, system_state, socket_instance, code, ip, log):
     """
@@ -223,11 +222,12 @@ def get_keypad_or_rfid_input(keypad_instance, rfid_reader_instance, authorized_t
 
                 # Check for POST request for remote unlock
                 if "POST /" in request_str:
-                    # Super simple password parsing
-                    body_start = request_str.find("password=")
+                    # Super simple code parsing
+                    body_start = request_str.find("code=")
                     if body_start != -1:
-                        password_submitted = request_str[body_start + 9:]
-                        if password_submitted == REMOTE_UNLOCK_PASSWORD:
+                        # Access code is always 6 digits
+                        code_submitted = request_str[body_start + 5:body_start + 11]
+                        if code_submitted == code:
                             return "REMOTE_UNLOCK"
 
                 # Otherwise, serve the normal page
@@ -249,26 +249,86 @@ def web_page(code, ip, status, log):
     <html>
         <head>
             <title>Pico W Security</title>
-            <meta http-equiv="refresh" content="15">
+            <meta http-equiv="refresh" content="30">
+            <style>
+                .blurred {{
+                    filter: blur(5px);
+                    user-select: none;
+                    transition: filter 0.3s;
+                }}
+                .blurred:hover {{
+                    filter: blur(2px);
+                }}
+                .keypad {{
+                    display: grid;
+                    grid-template-columns: repeat(3, 1fr);
+                    gap: 10px;
+                    max-width: 250px;
+                    margin: 20px 0;
+                }}
+                .keypad button {{
+                    padding: 15px;
+                    font-size: 1.2em;
+                    cursor: pointer;
+                }}
+                #entered-code {{
+                    font-size: 2em;
+                    letter-spacing: 10px;
+                    margin: 10px 0;
+                    font-family: monospace;
+                    font-weight: bold;
+                    color: #333;
+                }}
+            </style>
         </head>
         <body>
             <h1>Pico W Security System</h1>
             <p><strong>Status:</strong> {status}</p>
             <hr>
-            <h2>Random Access Code</h2>
-            <p>Enter this code on the keypad:</p>
-            <h2 style="color: blue;">{code}</h2>
+            <h2>Access Code</h2>
+            <p>To unlock the door, you must enter the following code:</p>
+            <h2 class="blurred" style="color: blue;">{code}</h2>
+            <hr>
+            <h3>Digital Remote Control</h3>
+            <p>Enter 6-digit code to unlock:</p>
+            <div id="entered-code">______</div>
+            <div class="keypad">
+                <button onclick="press('1')">1</button><button onclick="press('2')">2</button><button onclick="press('3')">3</button>
+                <button onclick="press('4')">4</button><button onclick="press('5')">5</button><button onclick="press('6')">6</button>
+                <button onclick="press('7')">7</button><button onclick="press('8')">8</button><button onclick="press('9')">9</button>
+                <button onclick="press('C')">C</button><button onclick="press('0')">0</button><button onclick="press('OK')">OK</button>
+            </div>
+            <form id="unlock-form" action="/" method="post">
+                <input type="hidden" name="code" id="code-input">
+            </form>
+            <script>
+                let entered = "";
+                const display = document.getElementById('entered-code');
+                const input = document.getElementById('code-input');
+                const form = document.getElementById('unlock-form');
+                function press(key) {{
+                    if (key === 'C') {{
+                        entered = "";
+                    }} else if (key === 'OK') {{
+                        if (entered.length === 6) {{
+                            input.value = entered;
+                            form.submit();
+                        }} else {{
+                            alert("Please enter 6 digits.");
+                        }}
+                    }} else {{
+                        if (entered.length < 6) {{
+                            entered += key;
+                        }}
+                    }}
+                    display.innerText = entered.padEnd(6, "_");
+                }}
+            </script>
             <hr>
             <h3>Event Log</h3>
             <ul>
                 {log_html}
             </ul>
-            <hr>
-            <h3>Remote Unlock</h3>
-            <form action="/" method="post">
-                Password: <input type="password" name="password">
-                <input type="submit" value="Unlock">
-            </form>
             <p>Connect to your Pico W at: {ip}</p>
         </body>
     </html>
