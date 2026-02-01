@@ -10,6 +10,7 @@ import network
 import socket
 import time
 from machine import Pin, PWM, I2C, SPI
+import random
 import json
 import urequests
 from lib.keypad import Keypad
@@ -177,8 +178,8 @@ def connect_wifi(ssid, password):
     return status[0]
 
 def generate_code():
-    """Returns the fixed 6-digit access code."""
-    return "576809"
+    """Generates a 6-digit random code."""
+    return "".join([str(random.randint(0, 9)) for _ in range(6)])
 
 def get_keypad_or_rfid_input(keypad_instance, rfid_reader_instance, authorized_tags_list, system_state, socket_instance, code, ip, log):
     """
@@ -216,25 +217,28 @@ def get_keypad_or_rfid_input(keypad_instance, rfid_reader_instance, authorized_t
         if socket_instance is not None:
             try:
                 cl, addr = socket_instance.accept()
-                print('Client connected from', addr)
-                request = cl.recv(1024)
-                request_str = request.decode('utf-8')
+                try:
+                    print('Client connected from', addr)
+                    request = cl.recv(1024)
+                    request_str = request.decode('utf-8')
 
-                # Check for POST request for remote unlock
-                if "POST /" in request_str:
-                    # Super simple code parsing
-                    body_start = request_str.find("code=")
-                    if body_start != -1:
-                        # Access code is always 6 digits
-                        code_submitted = request_str[body_start + 5:body_start + 11]
-                        if code_submitted == code:
-                            return "REMOTE_UNLOCK"
+                    # Check for POST request for remote unlock
+                    if "POST /" in request_str:
+                        # Super simple code parsing
+                        body_start = request_str.find("code=")
+                        if body_start != -1:
+                            # Access code is always 6 digits
+                            code_submitted = request_str[body_start + 5:body_start + 11]
+                            if code_submitted == "576809":
+                                cl.close()
+                                return "REMOTE_UNLOCK"
 
-                # Otherwise, serve the normal page
-                response = web_page(code, ip, system_state, log)
-                cl.send('HTTP/1.0 200 OK\r\nContent-type: text/html\r\n\r\n')
-                cl.send(response)
-                cl.close()
+                    # Otherwise, serve the normal page
+                    response = web_page(code, ip, system_state, log)
+                    cl.send('HTTP/1.0 200 OK\r\nContent-type: text/html\r\n\r\n')
+                    cl.send(response)
+                finally:
+                    cl.close()
             except OSError:
                 pass
 
@@ -287,7 +291,11 @@ def web_page(code, ip, status, log):
             <hr>
             <h2>Access Code</h2>
             <p>To unlock the door, you must enter the following code:</p>
-            <h2 class="blurred" style="color: blue;">{code}</h2>
+            <h2 style="color: blue;">{code}</h2>
+            <hr>
+            <h2>Remote Control Code</h2>
+            <p>Use this code for the Digital Remote Control below:</p>
+            <h2 class="blurred" style="color: green;">576809</h2>
             <hr>
             <h3>Digital Remote Control</h3>
             <p>Enter 6-digit code to unlock:</p>
@@ -454,7 +462,8 @@ if __name__ == "__main__":
                 else:
                     log_event(f"Incorrect code: {user_input}")
                     print("Incorrect code. Please try again.")
-                    play_error_tone(buzzer)
+                    # Beep for 1000ms on incorrect code
+                    play_tone(buzzer, 440, 1.0)
                     display_message(oled, "Access Denied", "", duration_s=2)
 
             elif system_state == "UNLOCKED":
