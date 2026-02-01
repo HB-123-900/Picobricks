@@ -90,7 +90,7 @@ def save_authorized_tags(tags):
 
 def play_tone(buzzer, frequency, duration):
     """Plays a tone on the buzzer."""
-    buzzer.duty_u16(1000)
+    buzzer.duty_u16(32768) # 50% duty cycle for maximum volume
     buzzer.freq(frequency)
     time.sleep(duration)
     buzzer.duty_u16(0)
