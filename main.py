@@ -20,8 +20,7 @@ from lib.ssd1306 import SSD1306_I2C
 # --- Hardware Setup ---
 # IMPORTANT: These are the GPIO pin numbers.
 # Please ensure your hardware is connected to these pins.
-SERVO_PIN = 15          # Pin for the servo motor's data line
-MOTION_PIN = 28         # Pin for the PIR motion sensor's output
+MAGNET_PIN = 15         # Pin for the electromagnet control (replaces motor)
 KEYPAD_ROWS = [0, 1, 2, 3] # Pins for the keypad rows
 KEYPAD_COLS = [4, 5, 6]   # Pins for the keypad columns
 
@@ -51,7 +50,6 @@ AUTHORIZED_TAGS_FILE = "authorized_tags.json"
 MAX_AUTHORIZED_TAGS = 2
 
 # --- Lock Configuration ---
-MOTION_IGNORE_DELAY_S = 3 # Seconds to ignore motion after unlocking
 REMOTE_UNLOCK_PASSWORD = "YOUR_SECRET_PASSWORD" # Change this!
 DURESS_CODE = "911911" # A 6-digit code that secretly triggers an alert
 IFTTT_WEBHOOK_URL = "YOUR_IFTTT_WEBHOOK_URL_HERE" # e.g., https://maker.ifttt.com/trigger/duress_alert/with/key/YOUR_KEY
@@ -146,13 +144,17 @@ def trigger_duress_notification():
         print("IFTTT webhook URL not configured.")
         log_event("Duress trigger failed: no URL")
 
-def set_servo_angle(servo, angle):
-    """Sets the servo to a specific angle."""
-    # This conversion might need tuning for your specific servo
-    min_duty = 1000  # Corresponds to 0 degrees
-    max_duty = 9000  # Corresponds to 180 degrees
-    duty = min_duty + (max_duty - min_duty) * (angle / 180)
-    servo.duty_u16(int(duty))
+def lock_door(magnet_pin):
+    """Locks the door using the electromagnet."""
+    # Assuming Energize to Lock (Fail-Safe) or a Relay module
+    # High typically energizes the magnet/relay
+    magnet_pin.value(1)
+    log_event("Door Locked")
+
+def unlock_door(magnet_pin):
+    """Unlocks the door using the electromagnet."""
+    magnet_pin.value(0)
+    log_event("Door Unlocked")
 
 def connect_wifi(ssid, password):
     """Connects the Pico W to the specified WiFi network."""
@@ -357,9 +359,7 @@ if __name__ == "__main__":
     print("Starting security system...")
 
     # --- Initialize Hardware ---
-    servo = PWM(Pin(SERVO_PIN))
-    servo.freq(50)
-    motion_sensor = Pin(MOTION_PIN, Pin.IN)
+    magnet = Pin(MAGNET_PIN, Pin.OUT)
     keypad = Keypad(KEYPAD_ROWS, KEYPAD_COLS)
     spi = SPI(1, baudrate=2500000, polarity=0, phase=0, sck=Pin(RFID_SCK), mosi=Pin(RFID_MOSI), miso=Pin(RFID_MISO))
     rfid_reader = MFRC522(spi=spi, gpioRst=RFID_RST, gpioCs=RFID_SDA)
@@ -374,8 +374,8 @@ if __name__ == "__main__":
     i2c = I2C(0, sda=Pin(OLED_SDA_PIN), scl=Pin(OLED_SCL_PIN), freq=400000)
     oled = SSD1306_I2C(OLED_WIDTH, OLED_HEIGHT, i2c)
 
-    set_servo_angle(servo, 0)
-    print("Servo, motion sensor, keypad, RFID, LEDs, buzzer, and OLED initialized.")
+    lock_door(magnet)
+    print("Magnet, keypad, RFID, LEDs, buzzer, and OLED initialized.")
 
     # --- RFID Tag Setup ---
     # Load authorized tags from file, or enter programming mode if none exist.
@@ -439,7 +439,7 @@ if __name__ == "__main__":
                     print("Duress code entered. Unlocking normally...")
                     trigger_duress_notification()
                     play_success_tone(buzzer) # Appear normal
-                    set_servo_angle(servo, 90)
+                    unlock_door(magnet)
                     system_state = "UNLOCKED"
                     print("System state: UNLOCKED")
                     display_message(oled, "Access Granted", "UNLOCKED", duration_s=2)
@@ -455,7 +455,7 @@ if __name__ == "__main__":
                         log_event("Unlocked with code")
                         print("Code Correct! Unlocking...")
                     play_success_tone(buzzer)
-                    set_servo_angle(servo, 90)
+                    unlock_door(magnet)
                     system_state = "UNLOCKED"
                     print("System state: UNLOCKED")
                     display_message(oled, "Access Granted", "UNLOCKED", duration_s=2)
@@ -467,23 +467,18 @@ if __name__ == "__main__":
                     display_message(oled, "Access Denied", "", duration_s=2)
 
             elif system_state == "UNLOCKED":
-                # System is unlocked, wait for door to close
+                # System is unlocked, wait 10 seconds before auto-locking
                 red_led.off()
                 green_led.on()
                 update_display(oled, "UNLOCKED")
-                print(f"Door unlocked. Ignoring motion for {MOTION_IGNORE_DELAY_S} seconds...")
-                time.sleep(MOTION_IGNORE_DELAY_S)
+                print("Door unlocked. Waiting 10 seconds before auto-locking...")
+                time.sleep(10)
 
-                print("Ready to lock. Waiting for door to close (motion trigger)...")
-                while motion_sensor.value() == 0:
-                    time.sleep(0.1)
-
-                print("Door closed. Locking now.")
-                log_event("Door closed and locked")
-                set_servo_angle(servo, 0)
+                print("Locking now.")
+                lock_door(magnet)
                 system_state = "LOCKED"
                 print("System state: LOCKED")
-                time.sleep(1) # Debounce/settle time
+                time.sleep(1) # Settle time
 
     except Exception as e:
         print(f"A critical error occurred: {e}")
